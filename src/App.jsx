@@ -24,11 +24,17 @@ async function getDb() {
           title TEXT NOT NULL,
           content TEXT NOT NULL,
           tags TEXT DEFAULT '[]',
+          is_pinned INTEGER DEFAULT 0,
           use_count INTEGER DEFAULT 0,
           last_used_at TEXT,
           created_at TEXT DEFAULT (datetime('now'))
         )
       `);
+      try {
+        await database.execute('ALTER TABLE templates ADD COLUMN is_pinned INTEGER DEFAULT 0');
+      } catch (_) {
+        // Column already exists on upgraded databases.
+      }
       await database.execute(`
         CREATE TABLE IF NOT EXISTS settings (
           key TEXT PRIMARY KEY,
@@ -52,6 +58,49 @@ function parseTags(raw) {
   } catch (_) {
     return [];
   }
+}
+
+function normalizeTemplate(template) {
+  return {
+    ...template,
+    tags: parseTags(template.tags),
+    is_pinned: Number(template.is_pinned) === 1 ? 1 : 0,
+    use_count: Number(template.use_count) || 0,
+  };
+}
+
+function orderTemplates(templates, savedOrder = []) {
+  const order = savedOrder.map(Number).filter(Number.isFinite);
+  const orderIndex = new Map(order.map((id, index) => [id, index]));
+  return [...templates].sort((a, b) => {
+    if (b.is_pinned !== a.is_pinned) return b.is_pinned - a.is_pinned;
+
+    const aIndex = orderIndex.has(a.id) ? orderIndex.get(a.id) : Number.MAX_SAFE_INTEGER;
+    const bIndex = orderIndex.has(b.id) ? orderIndex.get(b.id) : Number.MAX_SAFE_INTEGER;
+    if (aIndex !== bIndex) return aIndex - bIndex;
+
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+  });
+}
+
+function dateScore(value) {
+  if (!value) return 0;
+  const time = new Date(value.replace(' ', 'T')).getTime();
+  if (!Number.isFinite(time)) return 0;
+  const ageHours = Math.max(0, (Date.now() - time) / 36e5);
+  return Math.max(0, 120 - ageHours);
+}
+
+function buildSmartTemplates(templates) {
+  return [...templates]
+    .filter(t => t.is_pinned || t.use_count > 0 || t.last_used_at)
+    .sort((a, b) => {
+      const aScore = (a.is_pinned ? 10000 : 0) + a.use_count * 90 + dateScore(a.last_used_at);
+      const bScore = (b.is_pinned ? 10000 : 0) + b.use_count * 90 + dateScore(b.last_used_at);
+      if (bScore !== aScore) return bScore - aScore;
+      return new Date(b.last_used_at || b.created_at).getTime() - new Date(a.last_used_at || a.created_at).getTime();
+    })
+    .slice(0, 5);
 }
 
 function parseSavedPosition(raw) {
@@ -277,28 +326,23 @@ export default function App() {
   async function loadTemplates() {
     const database = await getDb();
     const all = await database.select('SELECT * FROM templates ORDER BY created_at DESC');
-    const recent = await database.select(
-      'SELECT * FROM templates WHERE last_used_at IS NOT NULL ORDER BY last_used_at DESC LIMIT 5'
-    );
-    const parsed = all.map(t => ({ ...t, tags: parseTags(t.tags) }));
+    const parsed = all.map(normalizeTemplate);
 
     // 读取保存的排序
     const orderRow = await database.select("SELECT value FROM settings WHERE key = 'template_order'");
+    let savedOrder = [];
     if (orderRow.length > 0) {
       try {
-        const order = JSON.parse(orderRow[0].value);
-        const map = Object.fromEntries(parsed.map(t => [t.id, t]));
-        const sorted = order.map(id => map[id]).filter(Boolean);
-        const extra = parsed.filter(t => !order.includes(t.id));
-        setTemplates([...sorted, ...extra]);
+        savedOrder = JSON.parse(orderRow[0].value);
       } catch (_) {
-        setTemplates(parsed);
+        savedOrder = [];
       }
-    } else {
-      setTemplates(parsed);
     }
 
-    setRecentTemplates(recent.map(t => ({ ...t, tags: parseTags(t.tags) })));
+    const ordered = orderTemplates(parsed, savedOrder);
+    setTemplates(ordered);
+    setRecentTemplates(buildSmartTemplates(ordered));
+
     const tags = new Set();
     all.forEach(t => parseTags(t.tags).forEach(tag => tags.add(tag)));
     setAllTags(Array.from(tags));
@@ -336,6 +380,13 @@ export default function App() {
     setTimeout(() => setCopiedId(null), 700);
     loadTemplates();
     return true;
+  }
+
+  async function togglePinned(template) {
+    const next = template.is_pinned ? 0 : 1;
+    const database = await getDb();
+    await database.execute('UPDATE templates SET is_pinned = ? WHERE id = ?', [next, template.id]);
+    loadTemplates();
   }
 
   async function saveTemplate(data) {
@@ -586,7 +637,7 @@ export default function App() {
                     <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/>
                     <path d="M7 4.5V7l2 1.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
                   </svg>
-                  最近使用
+                  常用推荐
                 </div>
                 {recentTemplates.map(t => (
                   <TemplateCard
@@ -599,6 +650,7 @@ export default function App() {
                     draggable={false}
                     wasLongPressRef={wasLongPressRef}
                     onCopy={copyTemplate}
+                    onTogglePin={togglePinned}
                     onEdit={t => openModal(t)}
                     onDelete={deleteTemplate}
                   />
@@ -632,6 +684,7 @@ export default function App() {
                     isSelected={idx === selectedIndex}
                     wasLongPressRef={wasLongPressRef}
                     onCopy={copyTemplate}
+                    onTogglePin={togglePinned}
                     onEdit={t => openModal(t)}
                     onDelete={deleteTemplate}
                     onPointerDown={handleCardPointerDown}
@@ -659,12 +712,13 @@ export default function App() {
 
 function TemplateCard({
   template, copiedId, errorId, compact, draggingId, isSelected = false, draggable = true,
-  wasLongPressRef, onCopy, onEdit, onDelete, onPointerDown, onPointerMove
+  wasLongPressRef, onCopy, onTogglePin, onEdit, onDelete, onPointerDown, onPointerMove
 }) {
   const [confirmDel, setConfirmDel] = useState(false);
   const isCopied = copiedId === template.id;
   const isError = errorId === template.id;
   const isDragging = draggable && draggingId === template.id;
+  const isPinned = template.is_pinned === 1;
 
   function handleDelete(e) {
     e.stopPropagation();
@@ -710,10 +764,19 @@ function TemplateCard({
         <div className="card-text">
           <div className="card-title">{template.title}</div>
           <div className="card-preview">
-            {template.content.replace(/\n/g, ' ')}
+            {template.content}
           </div>
         </div>
         <div className="card-btns" onClick={e => e.stopPropagation()}>
+          <button
+            className={`crd-btn crd-btn--pin ${isPinned ? 'crd-btn--pinned' : ''}`}
+            onClick={(e) => { e.stopPropagation(); onTogglePin(template); }}
+            title={isPinned ? '取消固定' : '固定模板'}
+          >
+            <svg viewBox="0 0 13 13" fill={isPinned ? 'currentColor' : 'none'} width="11" height="11">
+              <path d="M6.5 1.7l1.4 2.9 3.2.5-2.3 2.2.5 3.2-2.8-1.5-2.8 1.5.5-3.2-2.3-2.2 3.2-.5 1.4-2.9z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round"/>
+            </svg>
+          </button>
           <button className="crd-btn" onClick={(e) => { e.stopPropagation(); onEdit(template); }} title="编辑">
             <svg viewBox="0 0 13 13" fill="none" width="11" height="11">
               <path d="M8.5 2l2.5 2.5L4 11H1.5V8.5L8.5 2z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
