@@ -117,6 +117,7 @@ export default function App() {
   const [copiedId, setCopiedId] = useState(null);
   const [copyError, setCopyError] = useState(null);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [theme, setTheme] = useState(() => localStorage.getItem('clipmate-theme') || 'dark');
 
   // 拖动排序状态
   const [draggingId, setDraggingId] = useState(null);
@@ -251,6 +252,14 @@ export default function App() {
     setIsExpanded(next);
     isExpandedRef.current = next;
     await getCurrentWindow().setSize(new LogicalSize(WINDOW_W, next ? FULL_H : COMPACT_H)).catch(() => {});
+  }
+
+  function toggleTheme() {
+    setTheme(prev => {
+      const next = prev === 'dark' ? 'light' : 'dark';
+      localStorage.setItem('clipmate-theme', next);
+      return next;
+    });
   }
 
   function openModal(template) {
@@ -475,7 +484,7 @@ export default function App() {
   const showRecent = recentTemplates.length > 0 && !search && selectedTag === null;
 
   return (
-    <div className={`app ${isExpanded ? 'app--expanded' : ''}`}>
+    <div className={`app ${isExpanded ? 'app--expanded' : ''} ${theme === 'light' ? 'app--light' : ''}`}>
 
       {/* 标题栏 */}
       <div
@@ -490,6 +499,25 @@ export default function App() {
         </div>
         <span className="titlebar-name">ClipMate</span>
         <div className="titlebar-actions">
+          <button
+            className="tb-btn"
+            onClick={toggleTheme}
+            title={theme === 'dark' ? '切换到浅色模式' : '切换到夜间模式'}
+          >
+            {theme === 'dark'
+              ? (
+                <svg viewBox="0 0 14 14" fill="none" width="12" height="12">
+                  <circle cx="7" cy="7" r="3" stroke="currentColor" strokeWidth="1.35"/>
+                  <path d="M7 1.8v1.1M7 11.1v1.1M1.8 7h1.1M11.1 7h1.1M3.3 3.3l.8.8M9.9 9.9l.8.8M10.7 3.3l-.8.8M4.1 9.9l-.8.8" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round"/>
+                </svg>
+              )
+              : (
+                <svg viewBox="0 0 14 14" fill="none" width="12" height="12">
+                  <path d="M11.3 8.7A4.8 4.8 0 0 1 5.3 2.7 5 5 0 1 0 11.3 8.7z" stroke="currentColor" strokeWidth="1.35" strokeLinejoin="round"/>
+                </svg>
+              )
+            }
+          </button>
           <button className="tb-btn" onClick={toggleSize} title={isExpanded ? '收起' : '展开'}>
             {isExpanded
               ? <svg viewBox="0 0 14 14" fill="none" width="12" height="12"><path d="M2 9l5-5 5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
