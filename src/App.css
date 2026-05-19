@@ -54,22 +54,6 @@ body {
 }
 .titlebar:active { cursor: grabbing; }
 
-.titlebar-dots {
-  display: flex;
-  gap: 5px;
-  align-items: center;
-  pointer-events: none;
-}
-.titlebar-dots span {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  display: block;
-}
-.titlebar-dots span:nth-child(1) { background: rgba(255,94,87,0.65); }
-.titlebar-dots span:nth-child(2) { background: rgba(255,188,46,0.55); }
-.titlebar-dots span:nth-child(3) { background: rgba(39,200,63,0.55); }
-
 .titlebar-name {
   flex: 1;
   font-size: 12px;

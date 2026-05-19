@@ -494,9 +494,6 @@ export default function App() {
           getCurrentWindow().startDragging().catch(() => {});
         }}
       >
-        <div className="titlebar-dots">
-          <span /><span /><span />
-        </div>
         <span className="titlebar-name">ClipMate</span>
         <div className="titlebar-actions">
           <button
