@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import Database from '@tauri-apps/plugin-sql';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { availableMonitors, getCurrentWindow } from '@tauri-apps/api/window';
 import { LogicalSize, PhysicalPosition } from '@tauri-apps/api/dpi';
 import './App.css';
 
+const WINDOW_W = 420;
 const COMPACT_H = 350;
 const FULL_H = 580;
 
@@ -53,6 +54,58 @@ function parseTags(raw) {
   }
 }
 
+function parseSavedPosition(raw) {
+  try {
+    const { x, y } = JSON.parse(raw);
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      return { x, y };
+    }
+  } catch (_) {
+    // handled by caller
+  }
+  return null;
+}
+
+function isPositionOnVisibleDisplay(pos, monitors) {
+  const minVisible = 80;
+  return monitors.some(monitor => {
+    const area = monitor.workArea ?? { position: monitor.position, size: monitor.size };
+    const left = area.position.x;
+    const top = area.position.y;
+    const right = left + area.size.width;
+    const bottom = top + area.size.height;
+
+    return (
+      pos.x < right - minVisible &&
+      pos.x + WINDOW_W > left + minVisible &&
+      pos.y < bottom - minVisible &&
+      pos.y + COMPACT_H > top + minVisible
+    );
+  });
+}
+
+async function restoreSavedPosition(appWindow) {
+  const saved = localStorage.getItem('clipmate-position');
+  if (!saved) return;
+
+  const pos = parseSavedPosition(saved);
+  if (!pos) {
+    localStorage.removeItem('clipmate-position');
+    return;
+  }
+
+  try {
+    const monitors = await availableMonitors();
+    if (monitors.length > 0 && !isPositionOnVisibleDisplay(pos, monitors)) {
+      localStorage.removeItem('clipmate-position');
+      return;
+    }
+    await appWindow.setPosition(new PhysicalPosition(pos.x, pos.y));
+  } catch (_) {
+    localStorage.removeItem('clipmate-position');
+  }
+}
+
 export default function App() {
   const [templates, setTemplates] = useState([]);
   const [search, setSearch] = useState('');
@@ -96,6 +149,7 @@ export default function App() {
     let disposed = false;
     appWindow.onFocusChanged(({ payload: focused }) => {
       if (focused) {
+        restoreSavedPosition(appWindow);
         setTimeout(() => searchRef.current?.focus(), 60);
       }
       // 永久固定，失焦不隐藏
@@ -177,20 +231,7 @@ export default function App() {
   // 位置记忆
   useEffect(() => {
     const appWindow = getCurrentWindow();
-    const saved = localStorage.getItem('clipmate-position');
-    if (saved) {
-      try {
-        const { x, y } = JSON.parse(saved);
-        // 只恢复在屏幕可见范围内的位置（防止保存的位置在已断开的显示器上）
-        if (x >= 0 && y >= 0 && x < 9999 && y < 9999) {
-          appWindow.setPosition(new PhysicalPosition(x, y)).catch(() => {});
-        } else {
-          localStorage.removeItem('clipmate-position');
-        }
-      } catch (_) {
-        localStorage.removeItem('clipmate-position');
-      }
-    }
+    restoreSavedPosition(appWindow);
     let unlistenMove;
     let disposed = false;
     appWindow.onMoved(({ payload: pos }) => {
@@ -209,7 +250,7 @@ export default function App() {
     const next = !isExpanded;
     setIsExpanded(next);
     isExpandedRef.current = next;
-    await getCurrentWindow().setSize(new LogicalSize(420, next ? FULL_H : COMPACT_H)).catch(() => {});
+    await getCurrentWindow().setSize(new LogicalSize(WINDOW_W, next ? FULL_H : COMPACT_H)).catch(() => {});
   }
 
   function openModal(template) {
@@ -329,6 +370,19 @@ export default function App() {
   }
 
   // ── 拖动排序（实时重排，50ms 触发）──────────────────────────────
+  function clearPendingDrag() {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
+
+  function removeDragListeners() {
+    document.removeEventListener('pointermove', onDocPointerMove);
+    document.removeEventListener('pointerup', onDocPointerUp);
+    document.removeEventListener('pointercancel', onDocPointerUp);
+  }
+
   function handleCardPointerDown(template, e) {
     if (e.target.closest('.card-btns')) return;
     wasLongPressRef.current = false;
@@ -337,16 +391,19 @@ export default function App() {
     if (!e.target.closest('.drag-hint')) return;
 
     pressStartRef.current = { x: e.clientX, y: e.clientY };
+    clearPendingDrag();
+    removeDragListeners();
+
+    document.addEventListener('pointermove', onDocPointerMove);
+    document.addEventListener('pointerup', onDocPointerUp);
+    document.addEventListener('pointercancel', onDocPointerUp);
 
     longPressTimerRef.current = setTimeout(() => {
+      longPressTimerRef.current = null;
       wasLongPressRef.current = true;
       dragActiveRef.current = true;
       draggingIdRef.current = template.id;
       setDraggingId(template.id);
-
-      document.addEventListener('pointermove', onDocPointerMove);
-      document.addEventListener('pointerup', onDocPointerUp);
-      document.addEventListener('pointercancel', onDocPointerUp);
     }, 80);
   }
 
@@ -358,7 +415,13 @@ export default function App() {
   }
 
   function onDocPointerMove(e) {
-    if (!dragActiveRef.current) return;
+    if (!dragActiveRef.current) {
+      const dx = Math.abs(e.clientX - pressStartRef.current.x);
+      const dy = Math.abs(e.clientY - pressStartRef.current.y);
+      if (dx > 6 || dy > 6) clearPendingDrag();
+      return;
+    }
+
     const el = document.elementFromPoint(e.clientX, e.clientY);
     const card = el?.closest('[data-card-id]');
     if (!card) return;
@@ -381,10 +444,8 @@ export default function App() {
   }
 
   async function onDocPointerUp() {
-    clearTimeout(longPressTimerRef.current);
-    document.removeEventListener('pointermove', onDocPointerMove);
-    document.removeEventListener('pointerup', onDocPointerUp);
-    document.removeEventListener('pointercancel', onDocPointerUp);
+    clearPendingDrag();
+    removeDragListeners();
 
     if (!dragActiveRef.current) return;
     dragActiveRef.current = false;
@@ -394,6 +455,7 @@ export default function App() {
     setDraggingId(null);
 
     if (fromId) {
+      setTimeout(() => { wasLongPressRef.current = false; }, 0);
       await saveOrder(templatesRef.current);
     }
   }
