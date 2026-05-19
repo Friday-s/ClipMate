@@ -1,25 +1,31 @@
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, ShortcutState};
 
+fn toggle_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+        } else {
+            let _ = window.show();
+            // 不调用 set_focus()：Accessory policy + NSPanel 组合下，
+            // makeKeyAndOrderFront 会导致 macOS 立即将 panel orderOut。
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
-                    if shortcut.matches(Modifiers::ALT, Code::BracketRight)
-                        && event.state() == ShortcutState::Pressed
-                    {
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                // 不调用 set_focus()：Accessory policy + NSPanel 组合下，
-                                // makeKeyAndOrderFront 会导致 macOS 立即将 panel orderOut。
-                            }
-                        }
-                    }
+                    let is_toggle_shortcut =
+                        shortcut.matches(Modifiers::SUPER, Code::BracketLeft)
+                            || shortcut.matches(Modifiers::ALT, Code::BracketRight);
+
+                    if is_toggle_shortcut && event.state() == ShortcutState::Pressed {
+                        toggle_main_window(app);
+                    };
                 })
                 .build(),
         )
@@ -36,8 +42,17 @@ pub fn run() {
         .setup(|app| {
             // 快捷键注册失败时不中断 setup：可能是辅助功能权限未授予或被其他应用占用。
             // 此时直接显示窗口，让用户至少有可见入口，而不是应用完全打不开。
-            if let Err(e) = app.global_shortcut().register("Alt+BracketRight") {
-                eprintln!("global shortcut register failed: {e}");
+            let shortcuts = ["Command+BracketLeft", "Alt+BracketRight"];
+            let mut registered_any = false;
+            for shortcut in shortcuts {
+                if let Err(e) = app.global_shortcut().register(shortcut) {
+                    eprintln!("global shortcut register failed ({shortcut}): {e}");
+                } else {
+                    registered_any = true;
+                }
+            }
+
+            if !registered_any {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                 }
