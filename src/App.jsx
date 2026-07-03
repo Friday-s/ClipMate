@@ -157,6 +157,7 @@ async function restoreSavedPosition(appWindow) {
 
 export default function App() {
   const [templates, setTemplates] = useState([]);
+  const [startupError, setStartupError] = useState(null);
   const [search, setSearch] = useState('');
   const [selectedTag, setSelectedTag] = useState(null);
   const [recentTemplates, setRecentTemplates] = useState([]);
@@ -215,7 +216,10 @@ export default function App() {
 
   // 初始化
   useEffect(() => {
-    loadTemplates();
+    loadTemplates().catch(err => {
+      console.error('initial template load failed', err);
+      setStartupError('初始化失败，可能是数据库或 Tauri 运行时没有准备好。');
+    });
 
     const appWindow = getCurrentWindow();
     const handleKey = (e) => {
@@ -346,6 +350,7 @@ export default function App() {
     const tags = new Set();
     all.forEach(t => parseTags(t.tags).forEach(tag => tags.add(tag)));
     setAllTags(Array.from(tags));
+    setStartupError(null);
   }
 
   async function saveOrder(ordered) {
@@ -630,6 +635,19 @@ export default function App() {
           </div>
 
           <div className="content">
+            {startupError && (
+              <div className="empty">
+                {startupError}
+                <button className="clear-btn" onClick={() => {
+                  loadTemplates().catch(err => {
+                    console.error('retry template load failed', err);
+                    setStartupError('初始化失败，可能是数据库或 Tauri 运行时没有准备好。');
+                  });
+                }}>
+                  重试
+                </button>
+              </div>
+            )}
             {showRecent && isExpanded && (
               <div className="section">
                 <div className="section-label">
@@ -668,11 +686,11 @@ export default function App() {
                   所有模板
                 </div>
               )}
-              {filtered.length === 0 ? (
+              {!startupError && filtered.length === 0 ? (
                 <div className="empty">
                   {search ? <>没有找到 "{search}"</> : <>暂无模板 — 点击 + 新建</>}
                 </div>
-              ) : (
+              ) : !startupError && (
                 filtered.map((t, idx) => (
                   <TemplateCard
                     key={t.id}
