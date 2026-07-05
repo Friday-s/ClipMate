@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Agent Guidelines
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents when working with code in this repository.
 
 ## Commands
 
@@ -37,7 +37,7 @@ The database file lives at `~/Library/Application Support/com.ivor.clipmate/clip
 
 ### Key behaviors
 
-- **Window state**: Managed as a macOS `NSPanel` (via `tauri-nspanel`) so it stays visible when focus moves to another app. `hides_on_deactivate = false` and `floating_panel = true`. The app uses `ActivationPolicy::Accessory` — no Dock icon, no menu bar. Hide/show is the *only* visibility control; never call `set_focus()` after `show()` (the Accessory + NSPanel combination causes macOS to immediately `orderOut` the panel — there's an explicit comment about this in `lib.rs`).
+- **Window state**: Managed as a macOS `NSPanel` (via `tauri-nspanel`) so it stays visible when focus moves to another app and joins all Spaces/full-screen contexts. `hides_on_deactivate = false`, `floating_panel = true`, and collection behavior includes `FullScreenAuxiliary | CanJoinAllSpaces`. The app uses `ActivationPolicy::Accessory` — no Dock icon, no menu bar. Hide/show is the *only* visibility control; never call `set_focus()` after `show()` (the Accessory + NSPanel combination causes macOS to immediately `orderOut` the panel — there's an explicit comment about this in `lib.rs`).
 - **Window position**: Persisted to `localStorage` under `clipmate-position`; restored on each focus event (not on mount).
 - **Drag-to-reorder**: Long-press (80 ms threshold) activates drag. Drag state uses both React state (`draggingId`) and refs (`dragActiveRef`, `templatesRef`, `draggingIdRef`) — refs exist to avoid stale closures in `pointermove` handlers without triggering re-renders. Order is written back to the `settings` table on drop.
 - **Copy feedback**: Clicking a card copies content via `tauri-plugin-clipboard-manager` (write-only permission), increments `use_count`, updates `last_used_at`, and shows a 700 ms "已复制" animation.

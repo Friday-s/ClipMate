@@ -56,9 +56,10 @@ pub fn run() {
 // macOS：转为 NSPanel，禁止系统自动隐藏。
 // 隐藏逻辑完全交给 JS 的 onFocusChanged 处理，避免 Rust/JS 状态同步问题。
 #[cfg(target_os = "macos")]
+#[allow(deprecated)]
 fn setup_macos_panel(app: &mut tauri::App) {
     use tauri::ActivationPolicy;
-    use tauri_nspanel::WebviewWindowExt;
+    use tauri_nspanel::{cocoa::appkit::NSWindowCollectionBehavior, WebviewWindowExt};
 
     app.set_activation_policy(ActivationPolicy::Accessory);
 
@@ -76,4 +77,8 @@ fn setup_macos_panel(app: &mut tauri::App) {
     // 这样 JS 的 onFocusChanged 才是唯一的隐藏控制点
     panel.set_hides_on_deactivate(false);
     panel.set_floating_panel(true);
+    panel.set_collection_behaviour(
+        NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces,
+    );
 }
