@@ -617,15 +617,35 @@ body {
 .btn-solid:disabled { opacity: 0.28; cursor: not-allowed; box-shadow: none; }
 
 /* ── Drag to reorder ───────────────────────────── */
-.drag-hint {
+/* 左侧引导位：常态显示 ⌘序号，悬停显示拖拽手柄 */
+.card-lead {
+  position: relative;
+  width: 18px;
+  height: 24px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 24px;
+}
+
+.hotkey-badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.3);
+  font-variant-numeric: tabular-nums;
+  transition: opacity 0.15s;
+  pointer-events: none;
+}
+.card:hover .hotkey-badge { opacity: 0; }
+
+.drag-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: rgba(255,255,255,0.15);
   opacity: 0;
-  flex-shrink: 0;
   transition: opacity 0.15s;
   cursor: grab;
 }
@@ -900,3 +920,102 @@ body {
   border-color: rgba(79,70,229,0.4) !important;
   background: rgba(79,70,229,0.08) !important;
 }
+
+/* ── Search highlight ──────────────────────────── */
+.hl {
+  background: rgba(250,204,21,0.28);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+/* ── Titlebar dropdown menu ────────────────────── */
+.tb-menu-wrap {
+  position: relative;
+  display: flex;
+}
+
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+}
+
+.tb-menu {
+  position: absolute;
+  top: 32px;
+  left: 0;
+  z-index: 160;
+  background: #22222c;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 9px;
+  padding: 4px;
+  min-width: 128px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.menu-item {
+  text-align: left;
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.72);
+  font-size: 12.5px;
+  font-family: inherit;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s;
+}
+.menu-item:hover { background: rgba(99,102,241,0.22); color: #c7d2fe; }
+
+/* ── Toast ─────────────────────────────────────── */
+.toast {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 300;
+  padding: 8px 14px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: #fff;
+  background: rgba(38,38,50,0.97);
+  border: 1px solid rgba(255,255,255,0.12);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  max-width: calc(100% - 32px);
+  text-align: center;
+  pointer-events: none;
+  animation: toast-in 0.18s ease;
+}
+.toast--ok { border-color: rgba(99,102,241,0.5); }
+.toast--err { border-color: rgba(239,68,68,0.55); color: #fecaca; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translate(-50%, 6px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+/* ── Light theme variants for new UI ───────────── */
+.app--light .hotkey-badge { color: rgba(15,23,42,0.4); }
+.app--light .hl { background: rgba(234,179,8,0.34); }
+
+.app--light .tb-menu {
+  background: #ffffff;
+  border-color: rgba(15,23,42,0.12);
+  box-shadow: 0 12px 32px rgba(15,23,42,0.18);
+}
+.app--light .menu-item { color: rgba(15,23,42,0.7); }
+.app--light .menu-item:hover { background: rgba(79,70,229,0.12); color: #4338ca; }
+
+.app--light .toast {
+  background: rgba(255,255,255,0.98);
+  color: rgba(15,23,42,0.85);
+  border-color: rgba(79,70,229,0.4);
+  box-shadow: 0 8px 24px rgba(15,23,42,0.2);
+}
+.app--light .toast--err { border-color: rgba(220,38,38,0.5); color: #b91c1c; }
