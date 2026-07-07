@@ -37,7 +37,7 @@ npx tauri dev
 2. 编译 Rust 后端（首次编译约需 1–3 分钟）
 3. 打开 ClipMate 应用窗口
 
-> 如果只需调试前端 UI（不需要 Rust 功能），可单独运行 `npm run dev`，然后在浏览器访问 `http://localhost:1420`。
+> `npm run dev` 只会启动 Vite 开发服务器，不会启动 Tauri 容器、数据库插件或窗口 API。日常开发和排查启动问题时，请始终使用 `npx tauri dev`。
 
 ### 3. 生产构建
 
@@ -55,6 +55,7 @@ npx tauri build
 
 - **全局快捷键**：`Alt+]`（在任意应用中均可触发）
 - 窗口为 macOS NSPanel，切换到其他应用后仍保持可见
+- 唤出时会跟随当前鼠标所在屏幕，适配不同桌面、全屏页面和多显示器切换
 
 ### 管理模板
 

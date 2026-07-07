@@ -1,10 +1,14 @@
 import { useState, useEffect, useRef } from 'react';
 import Database from '@tauri-apps/plugin-sql';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { save, open } from '@tauri-apps/plugin-dialog';
+import { writeTextFile, readTextFile } from '@tauri-apps/plugin-fs';
+import { availableMonitors, cursorPosition, getCurrentWindow, monitorFromPoint } from '@tauri-apps/api/window';
 import { LogicalSize, PhysicalPosition } from '@tauri-apps/api/dpi';
+import { pinyin } from 'pinyin-pro';
 import './App.css';
 
+const WINDOW_W = 420;
 const COMPACT_H = 350;
 const FULL_H = 580;
 
@@ -23,11 +27,17 @@ async function getDb() {
           title TEXT NOT NULL,
           content TEXT NOT NULL,
           tags TEXT DEFAULT '[]',
+          is_pinned INTEGER DEFAULT 0,
           use_count INTEGER DEFAULT 0,
           last_used_at TEXT,
           created_at TEXT DEFAULT (datetime('now'))
         )
       `);
+      try {
+        await database.execute('ALTER TABLE templates ADD COLUMN is_pinned INTEGER DEFAULT 0');
+      } catch (_) {
+        // Column already exists on upgraded databases.
+      }
       await database.execute(`
         CREATE TABLE IF NOT EXISTS settings (
           key TEXT PRIMARY KEY,
@@ -53,8 +63,181 @@ function parseTags(raw) {
   }
 }
 
+// 生成拼音检索串：全拼 + 首字母，便于「rb → 日报」这类模糊匹配。
+// 非中文原样保留（consecutive 让连续英文合并成一段）。
+function pinyinForms(text) {
+  if (!text) return '';
+  try {
+    const full = pinyin(text, { toneType: 'none', type: 'array', nonZh: 'consecutive' }).join('');
+    const initials = pinyin(text, { pattern: 'first', toneType: 'none', type: 'array', nonZh: 'consecutive' }).join('');
+    return `${full} ${initials}`;
+  } catch (_) {
+    return '';
+  }
+}
+
+// 预建每条模板的检索索引（标题/正文/标签的字面 + 标题和标签的拼音）。
+// 正文只取字面、不做拼音，避免长文本拼音开销。
+function buildSearchIndex(title, content, tags) {
+  const tagText = tags.join(' ');
+  const py = pinyinForms(`${title} ${tagText}`);
+  return `${title}\n${content}\n${tagText}\n${py}`.toLowerCase();
+}
+
+// 在文本中高亮命中的查询子串（仅字面匹配，拼音命中不参与高亮）。
+function highlightText(text, query) {
+  const q = (query || '').trim().toLowerCase();
+  if (!q || !text) return text;
+  const lower = text.toLowerCase();
+  let idx = lower.indexOf(q);
+  if (idx === -1) return text;
+
+  const parts = [];
+  let i = 0;
+  let key = 0;
+  while (idx !== -1) {
+    if (idx > i) parts.push(text.slice(i, idx));
+    parts.push(<mark className="hl" key={key++}>{text.slice(idx, idx + q.length)}</mark>);
+    i = idx + q.length;
+    idx = lower.indexOf(q, i);
+  }
+  if (i < text.length) parts.push(text.slice(i));
+  return parts;
+}
+
+function normalizeTemplate(template) {
+  const tags = parseTags(template.tags);
+  return {
+    ...template,
+    tags,
+    is_pinned: Number(template.is_pinned) === 1 ? 1 : 0,
+    use_count: Number(template.use_count) || 0,
+    _search: buildSearchIndex(template.title || '', template.content || '', tags),
+  };
+}
+
+function orderTemplates(templates, savedOrder = []) {
+  const order = savedOrder.map(Number).filter(Number.isFinite);
+  const orderIndex = new Map(order.map((id, index) => [id, index]));
+  return [...templates].sort((a, b) => {
+    if (b.is_pinned !== a.is_pinned) return b.is_pinned - a.is_pinned;
+
+    const aIndex = orderIndex.has(a.id) ? orderIndex.get(a.id) : Number.MAX_SAFE_INTEGER;
+    const bIndex = orderIndex.has(b.id) ? orderIndex.get(b.id) : Number.MAX_SAFE_INTEGER;
+    if (aIndex !== bIndex) return aIndex - bIndex;
+
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+  });
+}
+
+function dateScore(value) {
+  if (!value) return 0;
+  const time = new Date(value.replace(' ', 'T')).getTime();
+  if (!Number.isFinite(time)) return 0;
+  const ageHours = Math.max(0, (Date.now() - time) / 36e5);
+  return Math.max(0, 120 - ageHours);
+}
+
+function buildSmartTemplates(templates) {
+  return [...templates]
+    .filter(t => t.is_pinned || t.use_count > 0 || t.last_used_at)
+    .sort((a, b) => {
+      const aScore = (a.is_pinned ? 10000 : 0) + a.use_count * 90 + dateScore(a.last_used_at);
+      const bScore = (b.is_pinned ? 10000 : 0) + b.use_count * 90 + dateScore(b.last_used_at);
+      if (bScore !== aScore) return bScore - aScore;
+      return new Date(b.last_used_at || b.created_at).getTime() - new Date(a.last_used_at || a.created_at).getTime();
+    })
+    .slice(0, 5);
+}
+
+function parseSavedPosition(raw) {
+  try {
+    const { x, y } = JSON.parse(raw);
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      return { x, y };
+    }
+  } catch (_) {
+    // handled by caller
+  }
+  return null;
+}
+
+function isPositionOnVisibleDisplay(pos, monitors) {
+  const minVisible = 80;
+  return monitors.some(monitor => {
+    const area = monitor.workArea ?? { position: monitor.position, size: monitor.size };
+    const left = area.position.x;
+    const top = area.position.y;
+    const right = left + area.size.width;
+    const bottom = top + area.size.height;
+
+    return (
+      pos.x < right - minVisible &&
+      pos.x + WINDOW_W > left + minVisible &&
+      pos.y < bottom - minVisible &&
+      pos.y + COMPACT_H > top + minVisible
+    );
+  });
+}
+
+async function restoreSavedPosition(appWindow) {
+  const saved = localStorage.getItem('clipmate-position');
+  if (!saved) return;
+
+  const pos = parseSavedPosition(saved);
+  if (!pos) {
+    localStorage.removeItem('clipmate-position');
+    return;
+  }
+
+  try {
+    const monitors = await availableMonitors();
+    if (monitors.length > 0 && !isPositionOnVisibleDisplay(pos, monitors)) {
+      localStorage.removeItem('clipmate-position');
+      return;
+    }
+    await appWindow.setPosition(new PhysicalPosition(pos.x, pos.y));
+  } catch (_) {
+    localStorage.removeItem('clipmate-position');
+  }
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+async function moveNearCurrentPointer(appWindow, expanded = false) {
+  const height = expanded ? FULL_H : COMPACT_H;
+  const gap = 16;
+
+  try {
+    const cursor = await cursorPosition();
+    const monitor = await monitorFromPoint(cursor.x, cursor.y);
+    if (!monitor) return;
+
+    const area = monitor.workArea ?? { position: monitor.position, size: monitor.size };
+    const left = area.position.x;
+    const top = area.position.y;
+    const right = left + area.size.width;
+    const bottom = top + area.size.height;
+
+    let x = cursor.x - WINDOW_W / 2;
+    let y = cursor.y + gap;
+    if (y + height > bottom - gap) {
+      y = cursor.y - height - gap;
+    }
+
+    x = clamp(x, left + gap, right - WINDOW_W - gap);
+    y = clamp(y, top + gap, bottom - height - gap);
+    await appWindow.setPosition(new PhysicalPosition(Math.round(x), Math.round(y)));
+  } catch (_) {
+    restoreSavedPosition(appWindow);
+  }
+}
+
 export default function App() {
   const [templates, setTemplates] = useState([]);
+  const [startupError, setStartupError] = useState(null);
   const [search, setSearch] = useState('');
   const [selectedTag, setSelectedTag] = useState(null);
   const [recentTemplates, setRecentTemplates] = useState([]);
@@ -64,6 +247,10 @@ export default function App() {
   const [copiedId, setCopiedId] = useState(null);
   const [copyError, setCopyError] = useState(null);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [theme, setTheme] = useState(() => localStorage.getItem('clipmate-theme') || 'dark');
+  const [toast, setToast] = useState(null);        // { type: 'ok' | 'err', msg }
+  const [menuOpen, setMenuOpen] = useState(false);
+  const toastTimerRef = useRef(null);
 
   // 拖动排序状态
   const [draggingId, setDraggingId] = useState(null);
@@ -96,6 +283,7 @@ export default function App() {
     let disposed = false;
     appWindow.onFocusChanged(({ payload: focused }) => {
       if (focused) {
+        moveNearCurrentPointer(appWindow, isExpandedRef.current);
         setTimeout(() => searchRef.current?.focus(), 60);
       }
       // 永久固定，失焦不隐藏
@@ -111,7 +299,10 @@ export default function App() {
 
   // 初始化
   useEffect(() => {
-    loadTemplates();
+    loadTemplates().catch(err => {
+      console.error('initial template load failed', err);
+      setStartupError('初始化失败，可能是数据库或 Tauri 运行时没有准备好。');
+    });
 
     const appWindow = getCurrentWindow();
     const handleKey = (e) => {
@@ -126,6 +317,17 @@ export default function App() {
 
       // Modal 打开时不接管列表导航键
       if (modalOpenRef.current) return;
+
+      // ⌘1–⌘9 / Ctrl+1–9：直接复制第 N 条（用修饰键避开搜索框输入数字的冲突）
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && /^[1-9]$/.test(e.key)) {
+        const idx = Number(e.key) - 1;
+        const list = filteredRef.current;
+        if (idx < list.length) {
+          e.preventDefault();
+          copyTemplate(list[idx]).then(ok => { if (ok) appWindow.hide(); });
+        }
+        return;
+      }
 
       if (e.key === 'ArrowDown') {
         const len = filteredRef.current.length;
@@ -177,20 +379,7 @@ export default function App() {
   // 位置记忆
   useEffect(() => {
     const appWindow = getCurrentWindow();
-    const saved = localStorage.getItem('clipmate-position');
-    if (saved) {
-      try {
-        const { x, y } = JSON.parse(saved);
-        // 只恢复在屏幕可见范围内的位置（防止保存的位置在已断开的显示器上）
-        if (x >= 0 && y >= 0 && x < 9999 && y < 9999) {
-          appWindow.setPosition(new PhysicalPosition(x, y)).catch(() => {});
-        } else {
-          localStorage.removeItem('clipmate-position');
-        }
-      } catch (_) {
-        localStorage.removeItem('clipmate-position');
-      }
-    }
+    restoreSavedPosition(appWindow);
     let unlistenMove;
     let disposed = false;
     appWindow.onMoved(({ payload: pos }) => {
@@ -209,7 +398,114 @@ export default function App() {
     const next = !isExpanded;
     setIsExpanded(next);
     isExpandedRef.current = next;
-    await getCurrentWindow().setSize(new LogicalSize(420, next ? FULL_H : COMPACT_H)).catch(() => {});
+    await getCurrentWindow().setSize(new LogicalSize(WINDOW_W, next ? FULL_H : COMPACT_H)).catch(() => {});
+  }
+
+  function toggleTheme() {
+    setTheme(prev => {
+      const next = prev === 'dark' ? 'light' : 'dark';
+      localStorage.setItem('clipmate-theme', next);
+      return next;
+    });
+  }
+
+  function showToast(msg, type = 'ok') {
+    setToast({ msg, type });
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 2200);
+  }
+
+  // 导出：按当前显示顺序写出 JSON 备份文件。
+  // 不导出数据库 id（导入后会变），顺序由数组次序决定，导入时按序重建。
+  async function exportTemplates() {
+    setMenuOpen(false);
+    try {
+      const rows = templates.map(t => ({
+        title: t.title,
+        content: t.content,
+        tags: t.tags,
+        is_pinned: t.is_pinned,
+        use_count: t.use_count,
+        last_used_at: t.last_used_at ?? null,
+        created_at: t.created_at ?? null,
+      }));
+      const payload = {
+        app: 'ClipMate',
+        schema: 1,
+        exported_at: new Date().toISOString(),
+        templates: rows,
+      };
+      const stamp = new Date().toISOString().slice(0, 10);
+      const path = await save({
+        defaultPath: `clipmate-backup-${stamp}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!path) return; // 用户取消
+      await writeTextFile(path, JSON.stringify(payload, null, 2));
+      showToast(`已导出 ${rows.length} 条模板`, 'ok');
+    } catch (err) {
+      console.error('export failed', err);
+      showToast('导出失败', 'err');
+    }
+  }
+
+  // 导入：非破坏性追加，不覆盖已有模板；无效条目跳过。
+  async function importTemplates() {
+    setMenuOpen(false);
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!selected) return;
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      const text = await readTextFile(path);
+      const data = JSON.parse(text);
+      const list = Array.isArray(data) ? data : data?.templates;
+      if (!Array.isArray(list)) {
+        showToast('文件格式不正确', 'err');
+        return;
+      }
+
+      const database = await getDb();
+      const newIds = [];
+      let skipped = 0;
+      for (const item of list) {
+        const title = typeof item?.title === 'string' ? item.title.trim() : '';
+        const content = typeof item?.content === 'string' ? item.content : '';
+        if (!title || !content) { skipped++; continue; }
+        const tags = Array.isArray(item.tags) ? item.tags : parseTags(item.tags);
+        const res = await database.execute(
+          `INSERT INTO templates (title, content, tags, is_pinned, use_count, last_used_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`,
+          [title, content, JSON.stringify(tags), item.is_pinned ? 1 : 0, Number(item.use_count) || 0, item.last_used_at ?? null, item.created_at ?? null]
+        );
+        if (res.lastInsertId != null) newIds.push(res.lastInsertId);
+      }
+
+      // 追加到现有排序末尾
+      if (newIds.length > 0) {
+        const orderRow = await database.select("SELECT value FROM settings WHERE key = 'template_order'");
+        let oldOrder = [];
+        if (orderRow.length > 0) {
+          try { oldOrder = JSON.parse(orderRow[0].value); } catch (_) { oldOrder = []; }
+        }
+        const merged = [...oldOrder.filter(id => !newIds.includes(id)), ...newIds];
+        await database.execute(
+          "INSERT OR REPLACE INTO settings (key, value) VALUES ('template_order', ?)",
+          [JSON.stringify(merged)]
+        );
+      }
+
+      await loadTemplates();
+      const msg = skipped > 0
+        ? `导入 ${newIds.length} 条（跳过 ${skipped} 条无效）`
+        : `导入 ${newIds.length} 条模板`;
+      showToast(msg, newIds.length > 0 ? 'ok' : 'err');
+    } catch (err) {
+      console.error('import failed', err);
+      showToast('导入失败：文件无法解析', 'err');
+    }
   }
 
   function openModal(template) {
@@ -227,31 +523,27 @@ export default function App() {
   async function loadTemplates() {
     const database = await getDb();
     const all = await database.select('SELECT * FROM templates ORDER BY created_at DESC');
-    const recent = await database.select(
-      'SELECT * FROM templates WHERE last_used_at IS NOT NULL ORDER BY last_used_at DESC LIMIT 5'
-    );
-    const parsed = all.map(t => ({ ...t, tags: parseTags(t.tags) }));
+    const parsed = all.map(normalizeTemplate);
 
     // 读取保存的排序
     const orderRow = await database.select("SELECT value FROM settings WHERE key = 'template_order'");
+    let savedOrder = [];
     if (orderRow.length > 0) {
       try {
-        const order = JSON.parse(orderRow[0].value);
-        const map = Object.fromEntries(parsed.map(t => [t.id, t]));
-        const sorted = order.map(id => map[id]).filter(Boolean);
-        const extra = parsed.filter(t => !order.includes(t.id));
-        setTemplates([...sorted, ...extra]);
+        savedOrder = JSON.parse(orderRow[0].value);
       } catch (_) {
-        setTemplates(parsed);
+        savedOrder = [];
       }
-    } else {
-      setTemplates(parsed);
     }
 
-    setRecentTemplates(recent.map(t => ({ ...t, tags: parseTags(t.tags) })));
+    const ordered = orderTemplates(parsed, savedOrder);
+    setTemplates(ordered);
+    setRecentTemplates(buildSmartTemplates(ordered));
+
     const tags = new Set();
     all.forEach(t => parseTags(t.tags).forEach(tag => tags.add(tag)));
     setAllTags(Array.from(tags));
+    setStartupError(null);
   }
 
   async function saveOrder(ordered) {
@@ -286,6 +578,13 @@ export default function App() {
     setTimeout(() => setCopiedId(null), 700);
     loadTemplates();
     return true;
+  }
+
+  async function togglePinned(template) {
+    const next = template.is_pinned ? 0 : 1;
+    const database = await getDb();
+    await database.execute('UPDATE templates SET is_pinned = ? WHERE id = ?', [next, template.id]);
+    loadTemplates();
   }
 
   async function saveTemplate(data) {
@@ -329,6 +628,19 @@ export default function App() {
   }
 
   // ── 拖动排序（实时重排，50ms 触发）──────────────────────────────
+  function clearPendingDrag() {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
+
+  function removeDragListeners() {
+    document.removeEventListener('pointermove', onDocPointerMove);
+    document.removeEventListener('pointerup', onDocPointerUp);
+    document.removeEventListener('pointercancel', onDocPointerUp);
+  }
+
   function handleCardPointerDown(template, e) {
     if (e.target.closest('.card-btns')) return;
     wasLongPressRef.current = false;
@@ -337,16 +649,19 @@ export default function App() {
     if (!e.target.closest('.drag-hint')) return;
 
     pressStartRef.current = { x: e.clientX, y: e.clientY };
+    clearPendingDrag();
+    removeDragListeners();
+
+    document.addEventListener('pointermove', onDocPointerMove);
+    document.addEventListener('pointerup', onDocPointerUp);
+    document.addEventListener('pointercancel', onDocPointerUp);
 
     longPressTimerRef.current = setTimeout(() => {
+      longPressTimerRef.current = null;
       wasLongPressRef.current = true;
       dragActiveRef.current = true;
       draggingIdRef.current = template.id;
       setDraggingId(template.id);
-
-      document.addEventListener('pointermove', onDocPointerMove);
-      document.addEventListener('pointerup', onDocPointerUp);
-      document.addEventListener('pointercancel', onDocPointerUp);
     }, 80);
   }
 
@@ -358,7 +673,13 @@ export default function App() {
   }
 
   function onDocPointerMove(e) {
-    if (!dragActiveRef.current) return;
+    if (!dragActiveRef.current) {
+      const dx = Math.abs(e.clientX - pressStartRef.current.x);
+      const dy = Math.abs(e.clientY - pressStartRef.current.y);
+      if (dx > 6 || dy > 6) clearPendingDrag();
+      return;
+    }
+
     const el = document.elementFromPoint(e.clientX, e.clientY);
     const card = el?.closest('[data-card-id]');
     if (!card) return;
@@ -381,10 +702,8 @@ export default function App() {
   }
 
   async function onDocPointerUp() {
-    clearTimeout(longPressTimerRef.current);
-    document.removeEventListener('pointermove', onDocPointerMove);
-    document.removeEventListener('pointerup', onDocPointerUp);
-    document.removeEventListener('pointercancel', onDocPointerUp);
+    clearPendingDrag();
+    removeDragListeners();
 
     if (!dragActiveRef.current) return;
     dragActiveRef.current = false;
@@ -394,16 +713,17 @@ export default function App() {
     setDraggingId(null);
 
     if (fromId) {
+      setTimeout(() => { wasLongPressRef.current = false; }, 0);
       await saveOrder(templatesRef.current);
     }
   }
 
   // 过滤
   const filtered = templates.filter(t => {
-    const q = search.toLowerCase();
-    const matchSearch = !search ||
-      t.title.toLowerCase().includes(q) ||
-      t.content.toLowerCase().includes(q);
+    const q = search.trim().toLowerCase();
+    const qNoSpace = q.replace(/\s+/g, '');
+    const idx = t._search || '';
+    const matchSearch = !q || idx.includes(q) || (qNoSpace && idx.includes(qNoSpace));
     const matchTag = selectedTag === null || t.tags.includes(selectedTag);
     return matchSearch && matchTag;
   });
@@ -413,7 +733,7 @@ export default function App() {
   const showRecent = recentTemplates.length > 0 && !search && selectedTag === null;
 
   return (
-    <div className={`app ${isExpanded ? 'app--expanded' : ''}`}>
+    <div className={`app ${isExpanded ? 'app--expanded' : ''} ${theme === 'light' ? 'app--light' : ''}`}>
 
       {/* 标题栏 */}
       <div
@@ -423,11 +743,52 @@ export default function App() {
           getCurrentWindow().startDragging().catch(() => {});
         }}
       >
-        <div className="titlebar-dots">
-          <span /><span /><span />
-        </div>
         <span className="titlebar-name">ClipMate</span>
         <div className="titlebar-actions">
+          <div className="tb-menu-wrap">
+            <button
+              className="tb-btn"
+              onClick={() => setMenuOpen(o => !o)}
+              title="更多"
+            >
+              <svg viewBox="0 0 14 14" fill="none" width="12" height="12">
+                <circle cx="3" cy="7" r="1.2" fill="currentColor"/>
+                <circle cx="7" cy="7" r="1.2" fill="currentColor"/>
+                <circle cx="11" cy="7" r="1.2" fill="currentColor"/>
+              </svg>
+            </button>
+            {menuOpen && (
+              <>
+                <div
+                  className="menu-backdrop"
+                  onMouseDown={(e) => { e.stopPropagation(); setMenuOpen(false); }}
+                />
+                <div className="tb-menu" onMouseDown={(e) => e.stopPropagation()}>
+                  <button className="menu-item" onClick={exportTemplates}>导出备份…</button>
+                  <button className="menu-item" onClick={importTemplates}>导入备份…</button>
+                </div>
+              </>
+            )}
+          </div>
+          <button
+            className="tb-btn"
+            onClick={toggleTheme}
+            title={theme === 'dark' ? '切换到浅色模式' : '切换到夜间模式'}
+          >
+            {theme === 'dark'
+              ? (
+                <svg viewBox="0 0 14 14" fill="none" width="12" height="12">
+                  <circle cx="7" cy="7" r="3" stroke="currentColor" strokeWidth="1.35"/>
+                  <path d="M7 1.8v1.1M7 11.1v1.1M1.8 7h1.1M11.1 7h1.1M3.3 3.3l.8.8M9.9 9.9l.8.8M10.7 3.3l-.8.8M4.1 9.9l-.8.8" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round"/>
+                </svg>
+              )
+              : (
+                <svg viewBox="0 0 14 14" fill="none" width="12" height="12">
+                  <path d="M11.3 8.7A4.8 4.8 0 0 1 5.3 2.7 5 5 0 1 0 11.3 8.7z" stroke="currentColor" strokeWidth="1.35" strokeLinejoin="round"/>
+                </svg>
+              )
+            }
+          </button>
           <button className="tb-btn" onClick={toggleSize} title={isExpanded ? '收起' : '展开'}>
             {isExpanded
               ? <svg viewBox="0 0 14 14" fill="none" width="12" height="12"><path d="M2 9l5-5 5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -492,6 +853,19 @@ export default function App() {
           </div>
 
           <div className="content">
+            {startupError && (
+              <div className="empty">
+                {startupError}
+                <button className="clear-btn" onClick={() => {
+                  loadTemplates().catch(err => {
+                    console.error('retry template load failed', err);
+                    setStartupError('初始化失败，可能是数据库或 Tauri 运行时没有准备好。');
+                  });
+                }}>
+                  重试
+                </button>
+              </div>
+            )}
             {showRecent && isExpanded && (
               <div className="section">
                 <div className="section-label">
@@ -499,12 +873,13 @@ export default function App() {
                     <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/>
                     <path d="M7 4.5V7l2 1.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
                   </svg>
-                  最近使用
+                  常用推荐
                 </div>
                 {recentTemplates.map(t => (
                   <TemplateCard
                     key={`r-${t.id}`}
                     template={t}
+                    query={search}
                     copiedId={copiedId}
                     errorId={copyError}
                     compact={!isExpanded}
@@ -512,6 +887,7 @@ export default function App() {
                     draggable={false}
                     wasLongPressRef={wasLongPressRef}
                     onCopy={copyTemplate}
+                    onTogglePin={togglePinned}
                     onEdit={t => openModal(t)}
                     onDelete={deleteTemplate}
                   />
@@ -529,15 +905,17 @@ export default function App() {
                   所有模板
                 </div>
               )}
-              {filtered.length === 0 ? (
+              {!startupError && filtered.length === 0 ? (
                 <div className="empty">
                   {search ? <>没有找到 "{search}"</> : <>暂无模板 — 点击 + 新建</>}
                 </div>
-              ) : (
+              ) : !startupError && (
                 filtered.map((t, idx) => (
                   <TemplateCard
                     key={t.id}
                     template={t}
+                    query={search}
+                    hotkey={idx < 9 ? idx + 1 : null}
                     copiedId={copiedId}
                     errorId={copyError}
                     compact={!isExpanded}
@@ -545,6 +923,7 @@ export default function App() {
                     isSelected={idx === selectedIndex}
                     wasLongPressRef={wasLongPressRef}
                     onCopy={copyTemplate}
+                    onTogglePin={togglePinned}
                     onEdit={t => openModal(t)}
                     onDelete={deleteTemplate}
                     onPointerDown={handleCardPointerDown}
@@ -566,18 +945,23 @@ export default function App() {
         />
       )}
 
+      {toast && (
+        <div className={`toast toast--${toast.type}`}>{toast.msg}</div>
+      )}
+
     </div>
   );
 }
 
 function TemplateCard({
-  template, copiedId, errorId, compact, draggingId, isSelected = false, draggable = true,
-  wasLongPressRef, onCopy, onEdit, onDelete, onPointerDown, onPointerMove
+  template, query = '', hotkey = null, copiedId, errorId, compact, draggingId, isSelected = false, draggable = true,
+  wasLongPressRef, onCopy, onTogglePin, onEdit, onDelete, onPointerDown, onPointerMove
 }) {
   const [confirmDel, setConfirmDel] = useState(false);
   const isCopied = copiedId === template.id;
   const isError = errorId === template.id;
   const isDragging = draggable && draggingId === template.id;
+  const isPinned = template.is_pinned === 1;
 
   function handleDelete(e) {
     e.stopPropagation();
@@ -606,27 +990,41 @@ function TemplateCard({
       onPointerMove={draggable ? onPointerMove : undefined}
     >
       <div className="card-row">
-        {/* 拖动提示图标（最近使用区不显示，因为它不参与排序） */}
+        {/* 左侧引导位：常态显示 ⌘序号，悬停切换为拖拽手柄（最近使用区不显示） */}
         {draggable && (
-          <div className="drag-hint" title="长按拖动排序">
-            <svg viewBox="0 0 8 14" fill="none" width="8" height="14">
-              <circle cx="2" cy="2.5" r="1.2" fill="currentColor"/>
-              <circle cx="6" cy="2.5" r="1.2" fill="currentColor"/>
-              <circle cx="2" cy="7" r="1.2" fill="currentColor"/>
-              <circle cx="6" cy="7" r="1.2" fill="currentColor"/>
-              <circle cx="2" cy="11.5" r="1.2" fill="currentColor"/>
-              <circle cx="6" cy="11.5" r="1.2" fill="currentColor"/>
-            </svg>
+          <div className="card-lead">
+            {hotkey != null && (
+              <span className="hotkey-badge" title={`⌘${hotkey} 复制`}>{hotkey}</span>
+            )}
+            <span className="drag-hint" title="长按拖动排序">
+              <svg viewBox="0 0 8 14" fill="none" width="8" height="14">
+                <circle cx="2" cy="2.5" r="1.2" fill="currentColor"/>
+                <circle cx="6" cy="2.5" r="1.2" fill="currentColor"/>
+                <circle cx="2" cy="7" r="1.2" fill="currentColor"/>
+                <circle cx="6" cy="7" r="1.2" fill="currentColor"/>
+                <circle cx="2" cy="11.5" r="1.2" fill="currentColor"/>
+                <circle cx="6" cy="11.5" r="1.2" fill="currentColor"/>
+              </svg>
+            </span>
           </div>
         )}
 
         <div className="card-text">
-          <div className="card-title">{template.title}</div>
+          <div className="card-title">{highlightText(template.title, query)}</div>
           <div className="card-preview">
-            {template.content.replace(/\n/g, ' ')}
+            {highlightText(template.content, query)}
           </div>
         </div>
         <div className="card-btns" onClick={e => e.stopPropagation()}>
+          <button
+            className={`crd-btn crd-btn--pin ${isPinned ? 'crd-btn--pinned' : ''}`}
+            onClick={(e) => { e.stopPropagation(); onTogglePin(template); }}
+            title={isPinned ? '取消固定' : '固定模板'}
+          >
+            <svg viewBox="0 0 13 13" fill={isPinned ? 'currentColor' : 'none'} width="11" height="11">
+              <path d="M6.5 1.7l1.4 2.9 3.2.5-2.3 2.2.5 3.2-2.8-1.5-2.8 1.5.5-3.2-2.3-2.2 3.2-.5 1.4-2.9z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round"/>
+            </svg>
+          </button>
           <button className="crd-btn" onClick={(e) => { e.stopPropagation(); onEdit(template); }} title="编辑">
             <svg viewBox="0 0 13 13" fill="none" width="11" height="11">
               <path d="M8.5 2l2.5 2.5L4 11H1.5V8.5L8.5 2z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>

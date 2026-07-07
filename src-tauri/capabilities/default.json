@@ -10,6 +10,9 @@
     "core:window:allow-set-size",
     "core:window:allow-set-position",
     "core:window:allow-outer-position",
+    "core:window:allow-available-monitors",
+    "core:window:allow-cursor-position",
+    "core:window:allow-monitor-from-point",
     "core:window:allow-hide",
     "core:window:allow-show",
     "core:window:allow-is-visible",
@@ -22,6 +25,18 @@
     "sql:allow-load",
     "sql:allow-close",
     "clipboard-manager:allow-write-text",
-    "clipboard-manager:allow-read-text"
+    "clipboard-manager:allow-read-text",
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "fs:default",
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "$HOME/**" }]
+    },
+    {
+      "identifier": "fs:allow-read-text-file",
+      "allow": [{ "path": "$HOME/**" }]
+    }
   ]
 }
