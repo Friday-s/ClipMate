@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import Database from '@tauri-apps/plugin-sql';
-import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { writeText, readText } from '@tauri-apps/plugin-clipboard-manager';
+import { invoke } from '@tauri-apps/api/core';
 import { save, open } from '@tauri-apps/plugin-dialog';
 import { writeTextFile, readTextFile } from '@tauri-apps/plugin-fs';
 import { availableMonitors, cursorPosition, getCurrentWindow, monitorFromPoint } from '@tauri-apps/api/window';
@@ -52,6 +53,35 @@ async function getDb() {
     });
   }
   return dbPromise;
+}
+
+// 动态变量：复制时把占位符展开成实时值。
+// 支持 {date} {time} {datetime} {week} {clipboard}；无占位符时原样返回。
+async function expandVariables(content) {
+  if (!content.includes('{')) return content;
+
+  const now = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  const time = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  const week = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'][now.getDay()];
+
+  let out = content
+    .replaceAll('{date}', date)
+    .replaceAll('{time}', time)
+    .replaceAll('{datetime}', `${date} ${time}`)
+    .replaceAll('{week}', week);
+
+  if (out.includes('{clipboard}')) {
+    let clip = '';
+    try {
+      clip = (await readText()) || '';
+    } catch (_) {
+      // 剪贴板里不是文本（图片等）时读不到，替换为空串
+    }
+    out = out.replaceAll('{clipboard}', clip);
+  }
+  return out;
 }
 
 function parseTags(raw) {
@@ -248,9 +278,17 @@ export default function App() {
   const [copyError, setCopyError] = useState(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [theme, setTheme] = useState(() => localStorage.getItem('clipmate-theme') || 'dark');
-  const [toast, setToast] = useState(null);        // { type: 'ok' | 'err', msg }
+  const [toast, setToast] = useState(null);        // { type: 'ok' | 'err', msg, action? }
   const [menuOpen, setMenuOpen] = useState(false);
   const toastTimerRef = useRef(null);
+
+  // 自动粘贴：默认开启；关掉后仅复制到剪贴板
+  const [autoPaste, setAutoPaste] = useState(() => localStorage.getItem('clipmate-autopaste') !== '0');
+  const autoPasteRef = useRef(autoPaste);
+  useEffect(() => { autoPasteRef.current = autoPaste; }, [autoPaste]);
+
+  // 最近一次删除的快照，供「撤销」恢复
+  const deletedRef = useRef(null);
 
   // 拖动排序状态
   const [draggingId, setDraggingId] = useState(null);
@@ -409,10 +447,20 @@ export default function App() {
     });
   }
 
-  function showToast(msg, type = 'ok') {
-    setToast({ msg, type });
+  function showToast(msg, type = 'ok', action = null) {
+    setToast({ msg, type, action });
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = setTimeout(() => setToast(null), 2200);
+    // 带动作按钮的 toast 停留更久，给用户反应时间
+    toastTimerRef.current = setTimeout(() => setToast(null), action ? 4500 : 2200);
+  }
+
+  function toggleAutoPaste() {
+    setAutoPaste(prev => {
+      const next = !prev;
+      localStorage.setItem('clipmate-autopaste', next ? '1' : '0');
+      showToast(next ? '自动粘贴已开启' : '自动粘贴已关闭，改为仅复制', 'ok');
+      return next;
+    });
   }
 
   // 导出：按当前显示顺序写出 JSON 备份文件。
@@ -557,7 +605,8 @@ export default function App() {
 
   async function copyTemplate(template) {
     try {
-      await writeText(template.content);
+      const expanded = await expandVariables(template.content);
+      await writeText(expanded);
     } catch (err) {
       console.error('clipboard write failed', err);
       setCopyError(template.id);
@@ -577,6 +626,12 @@ export default function App() {
     setCopiedId(template.id);
     setTimeout(() => setCopiedId(null), 700);
     loadTemplates();
+
+    // 自动粘贴：Rust 侧隐藏面板、把焦点还给唤起前的应用并模拟 Cmd+V。
+    // 失败只影响“少按一次 Cmd+V”，内容已在剪贴板里，不算复制失败。
+    if (autoPasteRef.current) {
+      invoke('paste_to_previous').catch(err => console.warn('auto paste failed', err));
+    }
     return true;
   }
 
@@ -619,12 +674,58 @@ export default function App() {
   }
 
   async function deleteTemplate(id) {
+    // 删除前快照，供撤销恢复（含原排序位置）
+    const idx = templates.findIndex(t => t.id === id);
+    const snapshot = idx !== -1 ? { template: templates[idx], index: idx } : null;
+
     const database = await getDb();
     await database.execute('DELETE FROM templates WHERE id = ?', [id]);
     // 从保存的排序中也移除
     const newTemplates = templates.filter(t => t.id !== id);
     await saveOrder(newTemplates);
-    loadTemplates();
+    await loadTemplates();
+
+    if (snapshot) {
+      deletedRef.current = snapshot;
+      showToast(`已删除「${snapshot.template.title}」`, 'ok', { label: '撤销', onClick: undoDelete });
+    }
+  }
+
+  // 撤销删除：重新插入（id 会变），并尽量放回原来的排序位置
+  async function undoDelete() {
+    const snap = deletedRef.current;
+    if (!snap) return;
+    deletedRef.current = null;
+    setToast(null);
+
+    try {
+      const { template: t, index } = snap;
+      const database = await getDb();
+      const res = await database.execute(
+        `INSERT INTO templates (title, content, tags, is_pinned, use_count, last_used_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`,
+        [t.title, t.content, JSON.stringify(t.tags), t.is_pinned, t.use_count, t.last_used_at ?? null, t.created_at ?? null]
+      );
+      const newId = res.lastInsertId;
+      if (newId != null) {
+        const orderRow = await database.select("SELECT value FROM settings WHERE key = 'template_order'");
+        let order = [];
+        if (orderRow.length > 0) {
+          try { order = JSON.parse(orderRow[0].value); } catch (_) { order = []; }
+        }
+        order = order.filter(x => x !== newId);
+        order.splice(Math.min(index, order.length), 0, newId);
+        await database.execute(
+          "INSERT OR REPLACE INTO settings (key, value) VALUES ('template_order', ?)",
+          [JSON.stringify(order)]
+        );
+      }
+      await loadTemplates();
+      showToast('已恢复', 'ok');
+    } catch (err) {
+      console.error('undo delete failed', err);
+      showToast('恢复失败', 'err');
+    }
   }
 
   // ── 拖动排序（实时重排，50ms 触发）──────────────────────────────
@@ -750,6 +851,8 @@ export default function App() {
               className="tb-btn"
               onClick={() => setMenuOpen(o => !o)}
               title="更多"
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
             >
               <svg viewBox="0 0 14 14" fill="none" width="12" height="12">
                 <circle cx="3" cy="7" r="1.2" fill="currentColor"/>
@@ -763,9 +866,17 @@ export default function App() {
                   className="menu-backdrop"
                   onMouseDown={(e) => { e.stopPropagation(); setMenuOpen(false); }}
                 />
-                <div className="tb-menu" onMouseDown={(e) => e.stopPropagation()}>
-                  <button className="menu-item" onClick={exportTemplates}>导出备份…</button>
-                  <button className="menu-item" onClick={importTemplates}>导入备份…</button>
+                <div className="tb-menu" role="menu" onMouseDown={(e) => e.stopPropagation()}>
+                  <button
+                    className="menu-item"
+                    role="menuitemcheckbox"
+                    aria-checked={autoPaste}
+                    onClick={toggleAutoPaste}
+                  >
+                    自动粘贴{autoPaste ? '：开' : '：关'}
+                  </button>
+                  <button className="menu-item" role="menuitem" onClick={exportTemplates}>导出备份…</button>
+                  <button className="menu-item" role="menuitem" onClick={importTemplates}>导入备份…</button>
                 </div>
               </>
             )}
@@ -815,6 +926,7 @@ export default function App() {
             className={`sidebar-tag ${selectedTag === null ? 'active' : ''}`}
             onClick={() => setSelectedTag(null)}
             title="全部"
+            aria-pressed={selectedTag === null}
           >
             全部
           </button>
@@ -824,6 +936,7 @@ export default function App() {
               className={`sidebar-tag ${selectedTag === tag ? 'active' : ''}`}
               onClick={() => setSelectedTag(tag)}
               title={tag}
+              aria-pressed={selectedTag === tag}
             >
               {tag}
             </button>
@@ -847,14 +960,14 @@ export default function App() {
                 className="search-input"
               />
               {search && (
-                <button className="clear-btn" onClick={() => setSearch('')}>×</button>
+                <button className="clear-btn" onClick={() => setSearch('')} title="清空搜索" aria-label="清空搜索">×</button>
               )}
             </div>
           </div>
 
           <div className="content">
             {startupError && (
-              <div className="empty">
+              <div className="empty empty--error" role="alert">
                 {startupError}
                 <button className="clear-btn" onClick={() => {
                   loadTemplates().catch(err => {
@@ -866,7 +979,7 @@ export default function App() {
                 </button>
               </div>
             )}
-            {showRecent && isExpanded && (
+            {showRecent && (
               <div className="section">
                 <div className="section-label">
                   <svg viewBox="0 0 14 14" fill="none" width="10" height="10">
@@ -875,7 +988,7 @@ export default function App() {
                   </svg>
                   常用推荐
                 </div>
-                {recentTemplates.map(t => (
+                {(isExpanded ? recentTemplates : recentTemplates.slice(0, 2)).map(t => (
                   <TemplateCard
                     key={`r-${t.id}`}
                     template={t}
@@ -896,7 +1009,7 @@ export default function App() {
             )}
 
             <div className="section" ref={mainListRef}>
-              {showRecent && isExpanded && (
+              {showRecent && (
                 <div className="section-label">
                   <svg viewBox="0 0 14 14" fill="none" width="10" height="10">
                     <rect x="2" y="2" width="10" height="10" rx="2" stroke="currentColor" strokeWidth="1.3"/>
@@ -906,7 +1019,7 @@ export default function App() {
                 </div>
               )}
               {!startupError && filtered.length === 0 ? (
-                <div className="empty">
+                <div className="empty" role="status">
                   {search ? <>没有找到 "{search}"</> : <>暂无模板 — 点击 + 新建</>}
                 </div>
               ) : !startupError && (
@@ -946,7 +1059,19 @@ export default function App() {
       )}
 
       {toast && (
-        <div className={`toast toast--${toast.type}`}>{toast.msg}</div>
+        <div
+          className={`toast toast--${toast.type} ${toast.action ? 'toast--action' : ''}`}
+          role={toast.type === 'err' ? 'alert' : 'status'}
+          aria-live={toast.type === 'err' ? 'assertive' : 'polite'}
+          aria-atomic="true"
+        >
+          {toast.msg}
+          {toast.action && (
+            <button className="toast-btn" onClick={toast.action.onClick}>
+              {toast.action.label}
+            </button>
+          )}
+        </div>
       )}
 
     </div>
@@ -1020,6 +1145,7 @@ function TemplateCard({
             className={`crd-btn crd-btn--pin ${isPinned ? 'crd-btn--pinned' : ''}`}
             onClick={(e) => { e.stopPropagation(); onTogglePin(template); }}
             title={isPinned ? '取消固定' : '固定模板'}
+            aria-pressed={isPinned}
           >
             <svg viewBox="0 0 13 13" fill={isPinned ? 'currentColor' : 'none'} width="11" height="11">
               <path d="M6.5 1.7l1.4 2.9 3.2.5-2.3 2.2.5 3.2-2.8-1.5-2.8 1.5.5-3.2-2.3-2.2 3.2-.5 1.4-2.9z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round"/>
@@ -1108,7 +1234,13 @@ function TemplateModal({ template, allTags, onSave, onClose }) {
         if (e.target === e.currentTarget) getCurrentWindow().startDragging().catch(() => {});
       }}
     >
-      <div className="modal" onClick={e => e.stopPropagation()}>
+      <div
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="template-modal-title"
+        onClick={e => e.stopPropagation()}
+      >
         <div
           className="modal-head"
           onMouseDown={(e) => {
@@ -1116,8 +1248,8 @@ function TemplateModal({ template, allTags, onSave, onClose }) {
             getCurrentWindow().startDragging().catch(() => {});
           }}
         >
-          <h3>{template ? '编辑模板' : '新建模板'}</h3>
-          <button className="modal-close" onClick={onClose}>×</button>
+          <h3 id="template-modal-title">{template ? '编辑模板' : '新建模板'}</h3>
+          <button className="modal-close" onClick={onClose} title="关闭" aria-label="关闭">×</button>
         </div>
 
         <div className="modal-scroll">
@@ -1139,6 +1271,9 @@ function TemplateModal({ template, allTags, onSave, onClose }) {
             className="field-textarea"
             rows={10}
           />
+          <div className="field-hint">
+            {'支持动态变量：{date} {time} {datetime} {week} {clipboard}，复制时自动替换为实时值'}
+          </div>
 
           <label className="field-label">标签</label>
           {suggestedTags.length > 0 && (
@@ -1148,6 +1283,7 @@ function TemplateModal({ template, allTags, onSave, onClose }) {
                   key={tag}
                   type="button"
                   className={`tag-chip ${tags.includes(tag) ? 'tag-chip--on' : ''}`}
+                  aria-pressed={tags.includes(tag)}
                   onClick={() => toggleTag(tag)}
                 >
                   {tag}
@@ -1167,7 +1303,7 @@ function TemplateModal({ template, allTags, onSave, onClose }) {
               {tags.map(tag => (
                 <span key={tag} className="selected-chip">
                   {tag}
-                  <button type="button" onClick={() => toggleTag(tag)}>×</button>
+                  <button type="button" onClick={() => toggleTag(tag)} title={`移除标签 ${tag}`} aria-label={`移除标签 ${tag}`}>×</button>
                 </span>
               ))}
             </div>
