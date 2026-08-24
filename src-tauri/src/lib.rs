@@ -14,6 +14,10 @@ struct SingleInstanceLock {
     _file: std::fs::File,
 }
 
+// 唤起面板前记录的前台应用 pid，供「自动粘贴」把焦点还回去。
+// NonActivating 面板通常不会改变前台应用，但显式记录 + 激活最稳。
+struct FrontApp(std::sync::Mutex<Option<i32>>);
+
 fn clamp_to_range(value: i32, min: i32, max: i32) -> i32 {
     if min > max {
         min
@@ -57,6 +61,11 @@ pub fn run() {
                             if is_main_window_visible(app, &window) {
                                 hide_main_window(app, &window);
                             } else {
+                                // 显示面板前记下当前前台应用，自动粘贴时要把焦点还给它
+                                #[cfg(target_os = "macos")]
+                                if let Some(state) = app.try_state::<FrontApp>() {
+                                    *state.0.lock().unwrap() = frontmost_app_pid();
+                                }
                                 position_near_cursor(app, &window);
                                 show_main_window(app, &window);
                             }
@@ -79,6 +88,7 @@ pub fn run() {
     builder
         .setup(|app| {
             app.manage(instance_lock);
+            app.manage(FrontApp(std::sync::Mutex::new(None)));
 
             // 快捷键注册失败时不中断 setup：可能是辅助功能权限未授予或被其他应用占用。
             // 此时直接显示窗口，让用户至少有可见入口，而不是应用完全打不开。
@@ -94,7 +104,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![])
+        .invoke_handler(tauri::generate_handler![paste_to_previous])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -134,6 +144,86 @@ fn hide_main_window(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
     }
 
     let _ = window.hide();
+}
+
+// 自动粘贴：隐藏面板 → 激活唤起前记录的应用 → 模拟 Cmd+V。
+// 剪贴板内容由前端先写好；这里只负责焦点交还和键击。
+// 需要辅助功能权限（CGEventPost），与全局快捷键是同一个授权。
+#[tauri::command]
+fn paste_to_previous(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        hide_main_window(&app, &window);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let pid = app
+            .try_state::<FrontApp>()
+            .and_then(|s| *s.0.lock().unwrap());
+
+        // 激活必须在主线程；键击延迟等待目标应用真正拿回焦点
+        let _ = app.run_on_main_thread(move || {
+            if let Some(pid) = pid {
+                activate_app_by_pid(pid);
+            }
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(180));
+                post_cmd_v();
+            });
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn frontmost_app_pid() -> Option<i32> {
+    use tauri_nspanel::objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    unsafe {
+        let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null() {
+            return None;
+        }
+        let front: *mut Object = msg_send![workspace, frontmostApplication];
+        if front.is_null() {
+            return None;
+        }
+        let pid: i32 = msg_send![front, processIdentifier];
+        Some(pid)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn activate_app_by_pid(pid: i32) {
+    use tauri_nspanel::objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    unsafe {
+        let running: *mut Object = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if !running.is_null() {
+            // NSApplicationActivateIgnoringOtherApps = 1 << 1
+            let _: bool = msg_send![running, activateWithOptions: 2u64];
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn post_cmd_v() {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        eprintln!("CGEventSource create failed (accessibility permission?)");
+        return;
+    };
+
+    // 9 = ANSI 键盘布局中的 'v'
+    const KEY_V: u16 = 9;
+    for key_down in [true, false] {
+        if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), KEY_V, key_down) {
+            event.set_flags(CGEventFlags::CGEventFlagCommand);
+            event.post(CGEventTapLocation::HID);
+        }
+    }
 }
 
 // macOS：转为 NSPanel，禁止系统自动隐藏。
